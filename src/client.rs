@@ -4,11 +4,12 @@ use anyhow::Result;
 use futures::{SinkExt, StreamExt};
 use nix::sys::termios::{SetArg, Termios, cfmakeraw, tcgetattr, tcsetattr};
 use nix::unistd::isatty;
-use std::io::{self};
+use std::io::{self, Read};
 use std::os::fd::{AsRawFd, BorrowedFd};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::AsyncWriteExt;
 use tokio::net::UnixStream;
 use tokio::signal::unix::{SignalKind, signal};
+use tokio::sync::mpsc;
 use tokio_util::codec::Framed;
 
 pub struct RawModeGuard {
@@ -58,15 +59,28 @@ fn get_terminal_size() -> Result<(u16, u16)> {
     Ok((winsize.ws_col, winsize.ws_row))
 }
 
-async fn process_stdin(stdin: &mut tokio::io::Stdin, mut stdin_buf: &mut [u8]) -> Option<Packet> {
-    match stdin.read(&mut stdin_buf).await {
-        Ok(0) => None,
-        Ok(n) => {
-            let data = bytes::Bytes::copy_from_slice(&stdin_buf[..n]);
-            Some(Packet::Data(data))
+fn spawn_stdin_reader() -> mpsc::UnboundedReceiver<Packet> {
+    let (tx, rx) = mpsc::unbounded_channel();
+
+    std::thread::spawn(move || {
+        let mut stdin = std::io::stdin().lock();
+        let mut stdin_buf = [0u8; 4096];
+
+        loop {
+            match stdin.read(&mut stdin_buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    let data = bytes::Bytes::copy_from_slice(&stdin_buf[..n]);
+                    if tx.send(Packet::Data(data)).is_err() {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
         }
-        Err(_) => None,
-    }
+    });
+
+    rx
 }
 
 async fn process_signals(sigwinch: &mut tokio::signal::unix::Signal) -> Option<Packet> {
@@ -110,7 +124,7 @@ pub async fn attach(session_name: String) -> Result<()> {
     let (mut sink, mut stream) = framed.split();
 
     // 1. Sink Writer Task (Channel -> Socket)
-    let mut stdin = tokio::io::stdin();
+    let mut stdin_packets = spawn_stdin_reader();
     let writer_handle = tokio::spawn(async move {
         if let Ok((cols, rows)) = get_terminal_size() {
             let _ = sink.send(Packet::Resize(cols, rows)).await;
@@ -119,19 +133,20 @@ pub async fn attach(session_name: String) -> Result<()> {
             Ok(s) => s,
             Err(_) => return,
         };
-        let mut stdin_buf = [0u8; 4096];
 
         loop {
             let packet = tokio::select! {
-                res = process_stdin(&mut stdin, &mut stdin_buf) => res,
+                res = stdin_packets.recv() => res,
                 res = process_signals(&mut sigwinch) => res,
             };
-            if let Some(packet) = packet
-                && !sink.send(packet).await.is_err()
-            {
-                continue;
+            match packet {
+                Some(packet) => {
+                    if sink.send(packet).await.is_err() {
+                        break;
+                    }
+                }
+                None => break,
             }
-            break;
         }
     });
 
